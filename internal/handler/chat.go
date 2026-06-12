@@ -244,34 +244,29 @@ func (h *ChatHandler) streamWebToOpenAI(w http.ResponseWriter, model string, eve
 		if c == "" {
 			continue
 		}
-		if hasTools {
-			buffered.WriteString(c)
-		} else {
-			writeChunk(c, false)
-		}
+		// Always buffer to detect tool call syntax, regardless of hasTools
+		buffered.WriteString(c)
 	}
 
-	if hasTools {
-		finalText := strings.TrimSpace(buffered.String())
-		log.Printf("[tools] raw output (len=%d): %q", len(finalText), finalText[:min(len(finalText), 500)])
-		if toolcall.HasToolCallSyntax(finalText) {
-			calls := toolcall.ParseToolCallsFromText(finalText)
-			log.Printf("[tools] parsed %d calls from text", len(calls))
-			for i, c := range calls {
-				log.Printf("[tools] call[%d]: name=%s input=%v", i, c.Name, c.Input)
-			}
-			if len(calls) > 0 {
-				toolCalls := toolcall.ConvertToolCallsToOpenAI(calls)
-				log.Printf("[tools] detected %d tool calls in stream", len(toolCalls))
-				toolChunk := adapter.MakeOpenAIStreamToolCallChunk(model, toolCalls, true)
-				fmt.Fprintf(w, "data: %s\n\n", toolChunk)
-				fmt.Fprintf(w, "data: [DONE]\n\n")
-				flusher.Flush()
-				return
-			}
+	finalText := strings.TrimSpace(buffered.String())
+	log.Printf("[tools] raw output (len=%d): %q", len(finalText), finalText[:min(len(finalText), 500)])
+	if toolcall.HasToolCallSyntax(finalText) {
+		calls := toolcall.ParseToolCallsFromText(finalText)
+		log.Printf("[tools] parsed %d calls from text", len(calls))
+		for i, c := range calls {
+			log.Printf("[tools] call[%d]: name=%s input=%v", i, c.Name, c.Input)
 		}
-		writeChunk(finalText, false)
+		if len(calls) > 0 {
+			toolCalls := toolcall.ConvertToolCallsToOpenAI(calls)
+			log.Printf("[tools] detected %d tool calls in stream", len(toolCalls))
+			toolChunk := adapter.MakeOpenAIStreamToolCallChunk(model, toolCalls, true)
+			fmt.Fprintf(w, "data: %s\n\n", toolChunk)
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			return
+		}
 	}
+	writeChunk(finalText, false)
 
 	writeChunk("", true)
 	fmt.Fprintf(w, "data: [DONE]\n\n")
@@ -518,6 +513,22 @@ func (h *MessagesHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Inject tool definitions into the query if tools are provided
+	hasTools := len(req.Tools) > 0
+	if hasTools {
+		openaiTools := adapter.ConvertAnthropicToolsToOpenAI(req.Tools)
+		toolPrompt := toolcall.BuildToolPrompt(openaiTools)
+		if toolPrompt != "" {
+			// Prepend system message and tool prompt to the query
+			systemPrefix := ""
+			if req.System != "" {
+				systemPrefix = req.System + "\n\n"
+			}
+			query = systemPrefix + toolPrompt + "\n\nUser: " + query
+			log.Printf("[tools] injected %d tool definitions into Anthropic prompt", len(req.Tools))
+		}
+	}
+
 	convID := strings.ReplaceAll(uuid.New().String(), "-", "")
 
 	stats.Get().IncrConcurrency()
@@ -562,6 +573,7 @@ func (h *MessagesHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		flusher := w.(http.Flusher)
 		inThinking := false
+		var buffered strings.Builder
 		for event := range msgChan {
 			if event.Event != "message" {
 				continue
@@ -577,11 +589,50 @@ func (h *MessagesHandler) Handle(w http.ResponseWriter, r *http.Request) {
 				c := strings.ReplaceAll(msg.Content, "\u0000", "")
 				c, inThinking = filterThinkingChunk(c, inThinking)
 				if c != "" {
-					delta := adapter.AnthropicTextDelta{Type: "text_delta", Text: c}
-					fmt.Fprintf(w, "event: content_block_delta\ndata: %s\n\n", adapter.MakeAnthropicStreamEvent("content_block_delta", delta))
-					flusher.Flush()
+					buffered.WriteString(c)
+					if !hasTools {
+						delta := adapter.AnthropicTextDelta{Type: "text_delta", Text: c}
+						fmt.Fprintf(w, "event: content_block_delta\ndata: %s\n\n", adapter.MakeAnthropicStreamEvent("content_block_delta", delta))
+						flusher.Flush()
+					}
 				}
 			}
+		}
+		// Check for tool calls in buffered output
+		finalText := strings.TrimSpace(buffered.String())
+		if hasTools && toolcall.HasToolCallSyntax(finalText) {
+			calls := toolcall.ParseToolCallsFromText(finalText)
+			log.Printf("[tools] Anthropic stream: parsed %d calls from text", len(calls))
+			if len(calls) > 0 {
+				// Send tool_use blocks as streaming events
+				for i, c := range calls {
+					block := adapter.AnthropicToolUseBlock{
+						Type:  "tool_use",
+						ID:    "toolu_" + strings.ReplaceAll(uuid.New().String(), "-", "")[:24],
+						Name:  c.Name,
+						Input: c.Input,
+					}
+					event := map[string]interface{}{
+						"type":  "content_block_start",
+						"index": i,
+						"content_block": map[string]interface{}{
+							"type":  "tool_use",
+							"id":    block.ID,
+							"name":  block.Name,
+							"input": block.Input,
+						},
+					}
+					fmt.Fprintf(w, "event: content_block_start\ndata: %s\n\n", adapter.MakeAnthropicStreamEvent("content_block_start", event))
+				}
+				fmt.Fprintf(w, "event: message_delta\ndata: %s\n\n", adapter.MakeAnthropicStreamEvent("message_delta", map[string]interface{}{
+					"type":        "message_delta",
+					"stop_reason": "tool_use",
+				}))
+			}
+		} else if hasTools {
+			// No tool calls, send buffered text as stream
+			delta := adapter.AnthropicTextDelta{Type: "text_delta", Text: finalText}
+			fmt.Fprintf(w, "event: content_block_delta\ndata: %s\n\n", adapter.MakeAnthropicStreamEvent("content_block_delta", delta))
 		}
 		fmt.Fprintf(w, "event: message_stop\ndata: %s\n\n", adapter.MakeAnthropicStreamEvent("message_stop", nil))
 		flusher.Flush()
@@ -601,9 +652,42 @@ func (h *MessagesHandler) Handle(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		resp := adapter.MakeAnthropicResponse(routeResult.Model, strings.TrimSpace(content.String()))
-		w.Header().Set("Content-Type", "application/json")
-		w.Write(resp)
+		finalText := strings.TrimSpace(content.String())
+		// Check for tool calls in the response
+		if hasTools && toolcall.HasToolCallSyntax(finalText) {
+			calls := toolcall.ParseToolCallsFromText(finalText)
+			log.Printf("[tools] Anthropic: parsed %d calls from text", len(calls))
+			if len(calls) > 0 {
+				// Return Anthropic format with tool_use blocks
+				blocks := make([]interface{}, 0, len(calls))
+				for _, c := range calls {
+					blocks = append(blocks, adapter.AnthropicToolUseBlock{
+						Type:  "tool_use",
+						ID:    "toolu_" + strings.ReplaceAll(uuid.New().String(), "-", "")[:24],
+						Name:  c.Name,
+						Input: c.Input,
+					})
+				}
+				resp := map[string]interface{}{
+					"id":         fmt.Sprintf("msg_%s", uuid.New().String()[:24]),
+					"type":       "message",
+					"role":       "assistant",
+					"content":    blocks,
+					"model":      routeResult.Model,
+					"stop_reason": "tool_use",
+				}
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(resp)
+			} else {
+				resp := adapter.MakeAnthropicResponse(routeResult.Model, finalText)
+				w.Header().Set("Content-Type", "application/json")
+				w.Write(resp)
+			}
+		} else {
+			resp := adapter.MakeAnthropicResponse(routeResult.Model, finalText)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(resp)
+		}
 	}
 
 	// 记录 usage

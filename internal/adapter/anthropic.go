@@ -16,6 +16,22 @@ type AnthropicRequest struct {
 	MaxTokens   int                 `json:"max_tokens"`
 	Stream      bool                `json:"stream"`
 	Temperature *float64            `json:"temperature,omitempty"`
+	Tools       []AnthropicTool     `json:"tools,omitempty"`
+}
+
+// AnthropicTool 是 Anthropic 格式的工具定义
+type AnthropicTool struct {
+	Name        string                 `json:"name"`
+	Description string                 `json:"description,omitempty"`
+	InputSchema map[string]interface{} `json:"input_schema"`
+}
+
+// AnthropicToolUseBlock 是 Anthropic 格式的工具调用块
+type AnthropicToolUseBlock struct {
+	Type  string                 `json:"type"` // "tool_use"
+	ID    string                 `json:"id"`
+	Name  string                 `json:"name"`
+	Input map[string]interface{} `json:"input"`
 }
 
 // AnthropicMessage 是 Anthropic 格式的消息
@@ -86,4 +102,23 @@ func MakeAnthropicStreamEvent(eventType string, data interface{}) []byte {
 	}
 	b, _ := json.Marshal(event)
 	return b
+}
+
+// ConvertAnthropicToolsToOpenAI converts Anthropic tool definitions to OpenAI format
+func ConvertAnthropicToolsToOpenAI(tools []AnthropicTool) []OpenAITool {
+	if len(tools) == 0 {
+		return nil
+	}
+	result := make([]OpenAITool, 0, len(tools))
+	for _, t := range tools {
+		result = append(result, OpenAITool{
+			Type: "function",
+			Function: OpenAIToolFunction{
+				Name:        t.Name,
+				Description: t.Description,
+				Parameters:  t.InputSchema,
+			},
+		})
+	}
+	return result
 }
