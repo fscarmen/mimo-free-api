@@ -1,0 +1,102 @@
+name: Build Binary
+
+on:
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-frontend:
+    name: Build frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      - run: npm ci
+        working-directory: web
+
+      - run: npm run build
+        working-directory: web
+
+      - name: Upload static
+        uses: actions/upload-artifact@v7
+        with:
+          name: static
+          path: static/
+          retention-days: 1
+
+  build:
+    name: Build linux/${{ matrix.arch }}
+    needs: build-frontend
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+      fail-fast: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download static
+        uses: actions/download-artifact@v8
+        with:
+          name: static
+          path: static/
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.24"
+          check-latest: true
+
+      - name: Build
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+        run: |
+          BIN="mimo-gateway-linux-${{ matrix.arch }}"
+          go build -ldflags="-s -w" -o "${BIN}" .
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: mimo-gateway-linux-${{ matrix.arch }}
+          path: mimo-gateway-linux-${{ matrix.arch }}
+
+  package:
+    name: Package artifacts
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download amd64
+        uses: actions/download-artifact@v8
+        with:
+          name: mimo-gateway-linux-amd64
+          path: dist/
+
+      - name: Download arm64
+        uses: actions/download-artifact@v8
+        with:
+          name: mimo-gateway-linux-arm64
+          path: dist/
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum mimo-gateway-linux-* > checksums.txt
+          cat checksums.txt
+
+      - name: Upload all
+        uses: actions/upload-artifact@v7
+        with:
+          name: mimo-gateway-linux
+          path: dist/*
+          overwrite: true
